@@ -636,7 +636,11 @@ def _handle_shell(params):
     cmd = _text_param(params, "command", max_len=8000)
     timeout = _clamp(_int_param(params, "timeout_seconds", default=30), TIMEOUT_MIN, TIMEOUT_MAX)
     # Intentional arbitrary device shell — the one explicitly intended shell feature.
-    out, err, rc = _adb_shell("sh", "-c", cmd, timeout=timeout)
+    # adb joins argv with spaces before the device shell re-tokenizes them, so the
+    # script must be single-quoted to reach `sh -c` as ONE argument. Unquoted, any
+    # multi-word command silently ran only its first word (live-found 2026-09-26;
+    # regression: test_f05_agent_shell_multiword_survives_wire).
+    out, err, rc = _adb_shell("sh", "-c", shlex.quote(cmd), timeout=timeout)
     return _ok({"stdout": out, "stderr": err, "exit_code": rc})
 
 

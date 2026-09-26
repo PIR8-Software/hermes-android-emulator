@@ -587,7 +587,12 @@ if router is not None:
         """Run an arbitrary adb shell command (intentional raw device shell)."""
         _require_emulator()
         command = _text_q(command, "command", max_len=8000)
-        out, rc = _adb_text("shell", "sh", "-c", command, timeout=SHELL_TIMEOUT_MAX)
+        # adb joins argv with spaces before the device shell re-tokenizes them,
+        # so the script must be single-quoted to reach `sh -c` as ONE argument.
+        # Unquoted, any multi-word command silently ran only its first word
+        # (live-found 2026-09-26; regression: test_f05_*_shell_*_survives_wire).
+        out, rc = _adb_text("shell", "sh", "-c", shlex.quote(command),
+                            timeout=SHELL_TIMEOUT_MAX)
         return {"stdout": out, "exit_code": rc}
 
     # ── Screen recording lifecycle (F-08) ──────────────────────────────

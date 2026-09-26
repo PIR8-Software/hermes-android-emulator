@@ -8,6 +8,7 @@ device. Mapping to the closure matrix: F-01..F-12 each have at least one test.
 import importlib
 import json
 import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -237,6 +238,41 @@ def test_f05_deeplink_url_validated(agent_tools):
     assert res["success"] is False
     res = json.loads(tools["emu_deeplink"]({"url": "myapp://path/ok"}))
     assert res["success"] is True
+
+
+# ── F-05 addendum (live-found 2026-09-26): the raw device shell must survive
+# adb's wire semantics. adb joins argv with spaces and the device shell then
+# re-tokenizes the joined string, so an unquoted `sh -c <cmd>` ran only the
+# FIRST WORD of any multi-word command (live repro: POST /shell?command=echo
+# smoke-ok -> empty stdout, exit 0). The script must be quoted so it reaches
+# `sh -c` as one device-side argument.
+
+def _wire_sh_c_script(argv):
+    """Model the device-side parse: argv after `shell` is joined with spaces,
+    then tokenized by the device shell; return what `sh -c` actually runs."""
+    tail = list(argv)[list(argv).index("shell") + 1:]
+    tokens = shlex.split(" ".join(str(a) for a in tail))
+    return tokens[tokens.index("-c") + 1]
+
+
+def test_f05_api_shell_multiword_survives_wire(client, api_calls):
+    r = client.post("/api/plugins/android-emulator/shell",
+                    params={"command": "echo hello world"})
+    assert r.json().get("exit_code") == 0
+    assert _wire_sh_c_script(api_calls[-1]["argv"]) == "echo hello world"
+
+
+def test_f05_api_shell_quoting_survives_wire(client, api_calls):
+    cmd = "printf '%s' \"a b\" | tr a-z A-Z"
+    client.post("/api/plugins/android-emulator/shell", params={"command": cmd})
+    assert _wire_sh_c_script(api_calls[-1]["argv"]) == cmd
+
+
+def test_f05_agent_shell_multiword_survives_wire(agent_tools):
+    tools, calls = agent_tools
+    res = json.loads(tools["emu_shell"]({"command": "echo hello world"}))
+    assert res["success"] is True
+    assert _wire_sh_c_script(calls[-1]["argv"]) == "echo hello world"
 
 
 # ── F-06: unvalidated inputs crash handlers ───────────────────────────────
