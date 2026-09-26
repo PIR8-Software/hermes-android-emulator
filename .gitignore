@@ -1,24 +1,3 @@
-# Screenshots and recordings
-*.png
-*.jpg
-*.mp4
-*.log
-
-# Sensitive files
-.env
-*.key
-*.pem
-*.p12
-
-# Python
+tests/js_stubs/plugin_copy.mjs
 __pycache__/
 *.pyc
-*.pyo
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db

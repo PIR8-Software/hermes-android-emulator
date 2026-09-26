@@ -1,13 +1,137 @@
-"""Hermes plugin — control a headless Android emulator via ADB."""
+"""Hermes plugin — control a headless Android emulator via ADB.
+
+Safety contract (post-2026-09-26 audit remediation):
+- Every adb call is pinned to the emulator serial (`-s`). Commands refuse to run
+  against a non-emulator serial unless the operator deliberately opts in with
+  ANDROID_EMULATOR_ALLOW_NON_EMULATOR=1 (plus ANDROID_EMULATOR_SERIAL).
+- All non-shell parameters are validated/escaped before reaching the device
+  shell; `emu_shell` is the one intentional arbitrary-device-shell entry point.
+- Handlers never raise: every call returns a JSON envelope
+  ({"success": true|false, ...}).
+- Host-side file writes are confined to $HOME, the cwd, or the system temp dir
+  and never silently overwrite existing files.
+"""
 
 import json
 import os
+import re
+import shlex
 import subprocess
+import tempfile
+import uuid
+from pathlib import Path
 
 ADB = os.path.expanduser("~/Android/Sdk/platform-tools/adb")
 _EMU_SERIAL = os.environ.get("ANDROID_EMULATOR_SERIAL", "emulator-5554")
+# A non-emulator serial is only honoured with a deliberate second opt-in.
+_SERIAL_OVERRIDDEN = bool(os.environ.get("ANDROID_EMULATOR_ALLOW_NON_EMULATOR"))
 EMULATOR = os.path.expanduser("~/Android/Sdk/emulator/emulator")
 AVDMANAGER = os.path.expanduser("~/Android/Sdk/cmdline-tools/latest/bin/avdmanager")
+
+# ── Resource limits ─────────────────────────────────────────────────────────
+TIMEOUT_MIN, TIMEOUT_MAX = 1, 600
+LINES_MIN, LINES_MAX = 1, 5000
+TEXT_MAX = 2000
+COORD_MAX = 100000
+
+# ── Input validation ────────────────────────────────────────────────────────
+_RE_PACKAGE = re.compile(r"^[A-Za-z0-9._]+$")
+_RE_ACTIVITY = re.compile(r"^[A-Za-z0-9._$]+$")
+_RE_KEYCODE = re.compile(r"^[A-Z0-9_]{1,40}$")
+_RE_URL = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://[^\s;|&$`'\"()<>\\]+$")
+_RE_REMOTE = re.compile(r"^/[A-Za-z0-9._\-/]+$")
+_RE_LOGSPEC = re.compile(r"^(\*|[A-Za-z0-9_.\-]+):([VDIWEFS])$")
+_RE_FILTER_WORD = re.compile(r"^[A-Za-z0-9._\-]{0,64}$")
+
+
+def _clamp(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
+def _int_param(params, name, default=None, lo=None, hi=None, required=False):
+    """Coerce a parameter to int with bounds; raises ValueError for bad input."""
+    value = params.get(name, default)
+    if value is None or value == "":
+        if required:
+            raise ValueError(f"'{name}' is required")
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"'{name}' must be an integer")
+    try:
+        iv = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{name}' must be an integer, got {value!r}")
+    if lo is not None and hi is not None:
+        iv = _clamp(iv, lo, hi)
+    return iv
+
+
+def _text_param(params, name, required=True, max_len=TEXT_MAX):
+    value = params.get(name)
+    if value is None or value == "":
+        if required:
+            raise ValueError(f"'{name}' is required")
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"'{name}' must be a string")
+    if len(value) > max_len:
+        raise ValueError(f"'{name}' exceeds {max_len} characters")
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise ValueError(f"'{name}' must not contain control characters")
+    return value
+
+
+def _device_text(text):
+    """Escape free text for `adb shell input text` (device-shell-safe).
+
+    `input text` maps %s to a space and adb joins argv with spaces, so spaces
+    are pre-escaped as %s; shlex.quote neutralises shell metacharacters before
+    the string reaches the device shell. Quirk: a literal '%s' typed by the user
+    renders as a space.
+    """
+    return shlex.quote(text.replace(" ", "%s"))
+
+
+def _safe_host_write_path(raw_path, default=None, overwrite=False):
+    """Resolve a host write target and confine it to allowed roots.
+
+    Allowed roots: $HOME, the current working directory, the system temp dir,
+    or ANDROID_EMULATOR_OUTPUT_ROOT when set. Never silently overwrites.
+    """
+    if not raw_path:
+        raw_path = default
+    if not raw_path:
+        raise ValueError("no output path given")
+    p = Path(os.path.expanduser(str(raw_path)))
+    if not p.is_absolute():
+        p = Path.cwd() / p
+    resolved = p.resolve()
+    roots = [Path.home().resolve(), Path.cwd().resolve(),
+             Path(tempfile.gettempdir()).resolve()]
+    extra = os.environ.get("ANDROID_EMULATOR_OUTPUT_ROOT")
+    if extra:
+        roots.append(Path(os.path.expanduser(extra)).resolve())
+    if not any(resolved.is_relative_to(r) for r in roots):
+        raise ValueError(
+            f"output path must be under $HOME, the cwd, or the temp dir: {resolved}"
+        )
+    if resolved.exists() and not overwrite:
+        raise ValueError(f"refusing to overwrite existing file: {resolved} (pass overwrite=true)")
+    if not resolved.parent.exists():
+        raise ValueError(f"parent directory does not exist: {resolved.parent}")
+    return str(resolved)
+
+
+def _serial_guard():
+    """Refuse to act on a non-emulator serial unless explicitly overridden."""
+    if _SERIAL_OVERRIDDEN:
+        return None
+    if not _EMU_SERIAL.startswith("emulator"):
+        return (
+            f"refusing to run against serial {_EMU_SERIAL!r}: not an emulator. "
+            "Set ANDROID_EMULATOR_SERIAL explicitly to override."
+        )
+    return None
 
 
 def _run(cmd, timeout=30):
@@ -17,6 +141,8 @@ def _run(cmd, timeout=30):
         return r.stdout.strip(), r.stderr.strip(), r.returncode
     except subprocess.TimeoutExpired:
         return "", "Command timed out", -1
+    except Exception as e:
+        return "", f"{type(e).__name__}: {e}", -1
 
 
 def _adb(*args, timeout=30):
@@ -25,7 +151,7 @@ def _adb(*args, timeout=30):
 
 
 def _adb_shell(*args, timeout=30):
-    """Run adb shell <args>."""
+    """Run adb shell <args> on the emulator (serial-pinned)."""
     return _run([ADB, "-s", _EMU_SERIAL, "shell"] + list(args), timeout=timeout)
 
 
@@ -33,8 +159,27 @@ def _ok(data):
     return json.dumps({"success": True, **data})
 
 
-def _err(msg):
-    return json.dumps({"success": False, "error": msg})
+def _err(msg, code="error"):
+    return json.dumps({"success": False, "error": str(msg), "code": code})
+
+
+def _guarded(fn):
+    """Wrap a handler: serial guard + never-raise error envelope."""
+
+    def inner(params, **kw):
+        try:
+            guard = _serial_guard()
+            if guard:
+                return _err(guard, code="refused_serial")
+            return fn(params if isinstance(params, dict) else {})
+        except KeyError as e:
+            return _err(f"missing required parameter: {e.args[0]}", code="invalid_param")
+        except (TypeError, ValueError) as e:
+            return _err(str(e), code="invalid_param")
+        except Exception as e:  # pragma: no cover - safety net
+            return _err(f"{type(e).__name__}: {e}", code="internal")
+
+    return inner
 
 
 def register(ctx):
@@ -47,7 +192,7 @@ def register(ctx):
             "description": "Check emulator status: device list, Android version, model, boot state, screen size, available storage.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
-        handler=lambda p, **kw: _handle_status(),
+        handler=_guarded(lambda p: _handle_status()),
     )
 
     # ── emu_shell ───────────────────────────────────────────────────────
@@ -56,7 +201,7 @@ def register(ctx):
         toolset="android_emulator",
         schema={
             "name": "emu_shell",
-            "description": "Run an arbitrary adb shell command on the emulator. Returns stdout/stderr/exit code.",
+            "description": "Run an arbitrary adb shell command on the emulator (intentional raw device shell). Returns stdout/stderr/exit code.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -66,13 +211,13 @@ def register(ctx):
                     },
                     "timeout_seconds": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default 30)",
+                        "description": "Timeout in seconds, clamped to 1-600 (default 30)",
                     },
                 },
                 "required": ["command"],
             },
         },
-        handler=lambda p, **kw: _handle_shell(p),
+        handler=_guarded(lambda p: _handle_shell(p)),
     )
 
     # ── emu_install ─────────────────────────────────────────────────────
@@ -101,7 +246,7 @@ def register(ctx):
                 "required": ["apk_path"],
             },
         },
-        handler=lambda p, **kw: _handle_install(p),
+        handler=_guarded(lambda p: _handle_install(p)),
     )
 
     # ── emu_uninstall ───────────────────────────────────────────────────
@@ -122,7 +267,7 @@ def register(ctx):
                 "required": ["package"],
             },
         },
-        handler=lambda p, **kw: _handle_uninstall(p),
+        handler=_guarded(lambda p: _handle_uninstall(p)),
     )
 
     # ── emu_screenshot ──────────────────────────────────────────────────
@@ -137,13 +282,17 @@ def register(ctx):
                 "properties": {
                     "output_path": {
                         "type": "string",
-                        "description": "Where to save the PNG (default: /tmp/emu_screenshot.png)",
+                        "description": "Where to save the PNG (default: /tmp/emu_screenshot.png). Must be under $HOME, the cwd, or the temp dir.",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Allow replacing an existing file (default false)",
                     },
                 },
                 "required": [],
             },
         },
-        handler=lambda p, **kw: _handle_screenshot(p),
+        handler=_guarded(lambda p: _handle_screenshot(p)),
     )
 
     # ── emu_tap ─────────────────────────────────────────────────────────
@@ -162,7 +311,7 @@ def register(ctx):
                 "required": ["x", "y"],
             },
         },
-        handler=lambda p, **kw: _handle_tap(p),
+        handler=_guarded(lambda p: _handle_tap(p)),
     )
 
     # ── emu_swipe ───────────────────────────────────────────────────────
@@ -181,13 +330,13 @@ def register(ctx):
                     "y2": {"type": "integer", "description": "End Y"},
                     "duration_ms": {
                         "type": "integer",
-                        "description": "Duration in ms (default 300)",
+                        "description": "Duration in ms, clamped to 1-10000 (default 300)",
                     },
                 },
                 "required": ["x1", "y1", "x2", "y2"],
             },
         },
-        handler=lambda p, **kw: _handle_swipe(p),
+        handler=_guarded(lambda p: _handle_swipe(p)),
     )
 
     # ── emu_type ────────────────────────────────────────────────────────
@@ -196,19 +345,19 @@ def register(ctx):
         toolset="android_emulator",
         schema={
             "name": "emu_type",
-            "description": "Type text on the emulator (uses adb shell input text). Spaces must be escaped with %s.",
+            "description": "Type text on the emulator (uses adb shell input text). Spaces and shell metacharacters are escaped automatically.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "Text to type. Use %s for spaces.",
+                        "description": "Text to type (spaces are handled for you; a literal '%s' renders as a space)",
                     },
                 },
                 "required": ["text"],
             },
         },
-        handler=lambda p, **kw: _handle_type(p),
+        handler=_guarded(lambda p: _handle_type(p)),
     )
 
     # ── emu_key ─────────────────────────────────────────────────────────
@@ -229,7 +378,7 @@ def register(ctx):
                 "required": ["keycode"],
             },
         },
-        handler=lambda p, **kw: _handle_key(p),
+        handler=_guarded(lambda p: _handle_key(p)),
     )
 
     # ── emu_launch ──────────────────────────────────────────────────────
@@ -258,7 +407,7 @@ def register(ctx):
                 "required": [],
             },
         },
-        handler=lambda p, **kw: _handle_launch(p),
+        handler=_guarded(lambda p: _handle_launch(p)),
     )
 
     # ── emu_packages ────────────────────────────────────────────────────
@@ -273,13 +422,13 @@ def register(ctx):
                 "properties": {
                     "filter": {
                         "type": "string",
-                        "description": "Optional grep filter (e.g. 'google', 'com.example')",
+                        "description": "Optional package-name filter (e.g. 'google', 'com.example')",
                     },
                 },
                 "required": [],
             },
         },
-        handler=lambda p, **kw: _handle_packages(p),
+        handler=_guarded(lambda p: _handle_packages(p)),
     )
 
     # ── emu_push ────────────────────────────────────────────────────────
@@ -304,7 +453,7 @@ def register(ctx):
                 "required": ["local_path", "remote_path"],
             },
         },
-        handler=lambda p, **kw: _handle_push(p),
+        handler=_guarded(lambda p: _handle_push(p)),
     )
 
     # ── emu_pull ────────────────────────────────────────────────────────
@@ -313,7 +462,7 @@ def register(ctx):
         toolset="android_emulator",
         schema={
             "name": "emu_pull",
-            "description": "Pull a file from the emulator to the host.",
+            "description": "Pull a file from the emulator to the host. The destination must be under $HOME, the cwd, or the temp dir.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -325,11 +474,15 @@ def register(ctx):
                         "type": "string",
                         "description": "Destination path on the host",
                     },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Allow replacing an existing file (default false)",
+                    },
                 },
                 "required": ["remote_path", "local_path"],
             },
         },
-        handler=lambda p, **kw: _handle_pull(p),
+        handler=_guarded(lambda p: _handle_pull(p)),
     )
 
     # ── emu_logcat ──────────────────────────────────────────────────────
@@ -344,24 +497,108 @@ def register(ctx):
                 "properties": {
                     "filter": {
                         "type": "string",
-                        "description": "Logcat filter expression (e.g. 'ActivityManager:I *:S', '*:E'). Default: last 50 lines.",
+                        "description": "Logcat filter expression (e.g. 'ActivityManager:I *:S', '*:E').",
                     },
                     "lines": {
                         "type": "integer",
-                        "description": "Number of lines to retrieve (default 50)",
+                        "description": "Number of lines to retrieve, clamped to 1-5000 (default 50)",
                     },
                 },
                 "required": [],
             },
         },
-        handler=lambda p, **kw: _handle_logcat(p),
+        handler=_guarded(lambda p: _handle_logcat(p)),
+    )
+
+    # ── emu_gps ─────────────────────────────────────────────────────────
+    ctx.register_tool(
+        name="emu_gps",
+        toolset="android_emulator",
+        schema={
+            "name": "emu_gps",
+            "description": "Set a fake GPS location on the emulator (e.g. 'Set GPS to San Francisco'), or clear the override with clear=true.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lat": {"type": "number", "description": "Latitude (-90..90). Omit when clear=true."},
+                    "lng": {"type": "number", "description": "Longitude (-180..180). Omit when clear=true."},
+                    "clear": {"type": "boolean", "description": "Clear the GPS override instead of setting it"},
+                },
+                "required": [],
+            },
+        },
+        handler=_guarded(lambda p: _handle_gps(p)),
+    )
+
+    # ── emu_battery ─────────────────────────────────────────────────────
+    ctx.register_tool(
+        name="emu_battery",
+        toolset="android_emulator",
+        schema={
+            "name": "emu_battery",
+            "description": "Simulate battery state: set level 0-100 (e.g. 'Set battery to 25%'), unplug (draining), or reset to real values.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "level": {"type": "integer", "description": "Battery level 0-100"},
+                    "unplug": {"type": "boolean", "description": "Simulate unplugged (draining)"},
+                    "reset": {"type": "boolean", "description": "Reset to real battery values"},
+                },
+                "required": [],
+            },
+        },
+        handler=_guarded(lambda p: _handle_battery(p)),
+    )
+
+    # ── emu_network ─────────────────────────────────────────────────────
+    ctx.register_tool(
+        name="emu_network",
+        toolset="android_emulator",
+        schema={
+            "name": "emu_network",
+            "description": "Simulate network conditions: offline, slow, or fast.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "condition": {
+                        "type": "string",
+                        "description": "One of: offline, slow, fast",
+                    },
+                },
+                "required": ["condition"],
+            },
+        },
+        handler=_guarded(lambda p: _handle_network(p)),
+    )
+
+    # ── emu_deeplink ────────────────────────────────────────────────────
+    ctx.register_tool(
+        name="emu_deeplink",
+        toolset="android_emulator",
+        schema={
+            "name": "emu_deeplink",
+            "description": "Open a deep link / URL scheme on the emulator (e.g. 'Open deep link myapp://path').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "URL or deep link to open (e.g. myapp://path, https://example.com)",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+        handler=_guarded(lambda p: _handle_deeplink(p)),
     )
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────
 
 def _handle_status():
-    out, err, rc = _adb("devices", "-l")
+    # Read-only device listing (not device-targeted); info is gathered only from
+    # the pinned emulator serial, so a physical phone is never reported on.
+    out, err, rc = _run([ADB, "devices", "-l"])
     if rc != 0:
         return _err(f"adb devices failed: {err}")
 
@@ -370,10 +607,12 @@ def _handle_status():
         if line.strip() and "attached" not in line:
             devices.append(line.strip())
 
-    if not devices:
-        return _ok({"connected": False, "devices": []})
+    tail = out.split(_EMU_SERIAL, 1)[-1].split("\n", 1)[0] if _EMU_SERIAL in out else ""
+    connected = bool(tail) and "device" in tail
+    if not connected:
+        return _ok({"connected": False, "serial": _EMU_SERIAL, "devices": devices, "info": {}})
 
-    # Gather device info
+    # Gather device info (all pinned to the emulator serial)
     info = {}
     for key, cmd in [
         ("android_version", ["getprop", "ro.build.version.release"]),
@@ -390,23 +629,23 @@ def _handle_status():
     o, _, _ = _adb_shell("df", "-h", "/data")
     info["disk"] = o
 
-    return _ok({"connected": True, "devices": devices, "info": info})
+    return _ok({"connected": True, "serial": _EMU_SERIAL, "devices": devices, "info": info})
 
 
 def _handle_shell(params):
-    cmd = params.get("command", "")
-    if not cmd:
-        return _err("No command provided")
-    timeout = params.get("timeout_seconds", 30)
-    # Split the command for adb shell
+    cmd = _text_param(params, "command", max_len=8000)
+    timeout = _clamp(_int_param(params, "timeout_seconds", default=30), TIMEOUT_MIN, TIMEOUT_MAX)
+    # Intentional arbitrary device shell — the one explicitly intended shell feature.
     out, err, rc = _adb_shell("sh", "-c", cmd, timeout=timeout)
     return _ok({"stdout": out, "stderr": err, "exit_code": rc})
 
 
 def _handle_install(params):
-    apk = params.get("apk_path", "")
-    if not apk or not os.path.exists(apk):
-        return _err(f"APK not found: {apk}")
+    apk = _text_param(params, "apk_path", max_len=4096)
+    if not os.path.isfile(apk):
+        return _err(f"APK not found: {apk}", code="invalid_param")
+    if not apk.lower().endswith(".apk"):
+        return _err(f"not an .apk file: {apk}", code="invalid_param")
     args = [ADB, "-s", _EMU_SERIAL, "install"]
     if params.get("replace", True):
         args.append("-r")
@@ -418,16 +657,19 @@ def _handle_install(params):
 
 
 def _handle_uninstall(params):
-    pkg = params.get("package", "")
-    if not pkg:
-        return _err("No package name")
+    pkg = _text_param(params, "package", max_len=255)
+    if not _RE_PACKAGE.match(pkg):
+        return _err(f"invalid package name: {pkg}", code="invalid_param")
     out, err, rc = _adb("uninstall", pkg)
     return _ok({"stdout": out, "stderr": err, "exit_code": rc})
 
 
 def _handle_screenshot(params):
-    out_path = params.get("output_path", "/tmp/emu_screenshot.png")
-    remote = "/sdcard/hermes_screenshot.png"
+    out_path = _safe_host_write_path(
+        params.get("output_path"), "/tmp/emu_screenshot.png",
+        overwrite=bool(params.get("overwrite", False)),
+    )
+    remote = f"/sdcard/hermes_screenshot_{uuid.uuid4().hex[:8]}.png"
     _adb_shell("screencap", "-p", remote)
     out, err, rc = _adb("pull", remote, out_path)
     _adb_shell("rm", "-f", remote)
@@ -437,33 +679,36 @@ def _handle_screenshot(params):
 
 
 def _handle_tap(params):
-    x, y = params["x"], params["y"]
+    x = _int_param(params, "x", required=True, lo=0, hi=COORD_MAX)
+    y = _int_param(params, "y", required=True, lo=0, hi=COORD_MAX)
     out, err, rc = _adb_shell("input", "tap", str(x), str(y))
     return _ok({"tapped": [x, y], "exit_code": rc})
 
 
 def _handle_swipe(params):
-    args = ["input", "swipe", str(params["x1"]), str(params["y1"]),
-            str(params["x2"]), str(params["y2"]), str(params.get("duration_ms", 300))]
+    x1 = _int_param(params, "x1", required=True, lo=0, hi=COORD_MAX)
+    y1 = _int_param(params, "y1", required=True, lo=0, hi=COORD_MAX)
+    x2 = _int_param(params, "x2", required=True, lo=0, hi=COORD_MAX)
+    y2 = _int_param(params, "y2", required=True, lo=0, hi=COORD_MAX)
+    duration = _clamp(_int_param(params, "duration_ms", default=300), 1, 10000)
+    args = ["input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration)]
     out, err, rc = _adb_shell(*args)
     return _ok({"swiped": True, "exit_code": rc})
 
 
 def _handle_type(params):
-    text = params.get("text", "")
-    if not text:
-        return _err("No text provided")
-    out, err, rc = _adb_shell("input", "text", text)
+    text = _text_param(params, "text")
+    out, err, rc = _adb_shell("input", "text", _device_text(text))
     return _ok({"typed": text, "exit_code": rc})
 
 
 def _handle_key(params):
-    keycode = params.get("keycode", "")
-    if not keycode:
-        return _err("No keycode")
+    keycode = _text_param(params, "keycode", max_len=48).upper()
     # Normalize — accept both "HOME" and "KEYCODE_HOME"
     if not keycode.startswith("KEYCODE_"):
         keycode = f"KEYCODE_{keycode}"
+    if not _RE_KEYCODE.match(keycode):
+        return _err(f"invalid keycode: {keycode}", code="invalid_param")
     out, err, rc = _adb_shell("input", "keyevent", keycode)
     return _ok({"key": keycode, "exit_code": rc})
 
@@ -474,19 +719,33 @@ def _handle_launch(params):
     activity = params.get("activity")
 
     if url and not pkg:
+        url = _text_param(params, "url", max_len=2048)
+        if not _RE_URL.match(url):
+            return _err(f"invalid url: {url}", code="invalid_param")
         out, err, rc = _adb_shell("am", "start", "-a", "android.intent.action.VIEW", "-d", url)
         return _ok({"launched": url, "stdout": out, "stderr": err, "exit_code": rc})
 
     if pkg:
+        pkg = _text_param(params, "package", max_len=255)
+        if not _RE_PACKAGE.match(pkg):
+            return _err(f"invalid package name: {pkg}", code="invalid_param")
+        if activity:
+            activity = _text_param(params, "activity", max_len=255)
+            if not _RE_ACTIVITY.match(activity):
+                return _err(f"invalid activity: {activity}", code="invalid_param")
         component = f"{pkg}/{activity}" if activity else pkg
         out, err, rc = _adb_shell("am", "start", "-n", component)
         return _ok({"launched": component, "stdout": out, "stderr": err, "exit_code": rc})
 
-    return _err("Provide either 'package' or 'url'")
+    return _err("Provide either 'package' or 'url'", code="invalid_param")
 
 
 def _handle_packages(params):
     filt = params.get("filter", "")
+    if filt:
+        filt = _text_param(params, "filter", required=False, max_len=64)
+        if not _RE_FILTER_WORD.match(filt):
+            return _err(f"invalid filter: {filt}", code="invalid_param")
     cmd = ["pm", "list", "packages"]
     if filt:
         cmd.append(filt)
@@ -496,26 +755,93 @@ def _handle_packages(params):
 
 
 def _handle_push(params):
-    local = params.get("local_path", "")
-    remote = params.get("remote_path", "")
-    if not local or not os.path.exists(local):
-        return _err(f"Local file not found: {local}")
+    local = _text_param(params, "local_path", max_len=4096)
+    remote = _text_param(params, "remote_path", max_len=512)
+    if not _RE_REMOTE.match(remote):
+        return _err(f"invalid remote path: {remote}", code="invalid_param")
+    if not os.path.isfile(local):
+        return _err(f"Local file not found: {local}", code="invalid_param")
     out, err, rc = _adb("push", local, remote)
     return _ok({"pushed": local, "to": remote, "stdout": out, "exit_code": rc})
 
 
 def _handle_pull(params):
-    remote = params.get("remote_path", "")
-    local = params.get("local_path", "")
+    remote = _text_param(params, "remote_path", max_len=512)
+    if not _RE_REMOTE.match(remote):
+        return _err(f"invalid remote path: {remote}", code="invalid_param")
+    local = _safe_host_write_path(
+        params.get("local_path"), overwrite=bool(params.get("overwrite", False)),
+    )
     out, err, rc = _adb("pull", remote, local)
     return _ok({"pulled": remote, "to": local, "stdout": out, "exit_code": rc})
 
 
+def _logcat_specs(filt):
+    """Validate a logcat filter expression into safe argv specs."""
+    if not filt:
+        return []
+    specs = []
+    for part in filt.split():
+        if not _RE_LOGSPEC.match(part):
+            raise ValueError(f"invalid logcat filter spec: {part!r}")
+        specs.append(part)
+    return specs
+
+
 def _handle_logcat(params):
-    lines = params.get("lines", 50)
+    lines = _clamp(_int_param(params, "lines", default=50), LINES_MIN, LINES_MAX)
     filt = params.get("filter", "")
-    if filt:
-        out, err, rc = _adb_shell("logcat", "-d", "-t", str(lines), filt)
-    else:
-        out, err, rc = _adb_shell("logcat", "-d", "-t", str(lines))
+    specs = _logcat_specs(_text_param(params, "filter", required=False, max_len=256) if filt else "")
+    args = ["logcat", "-d", "-t", str(lines)] + specs
+    out, err, rc = _adb_shell(*args)
     return _ok({"lines": out.splitlines()[-lines:], "exit_code": rc})
+
+
+def _handle_gps(params):
+    if params.get("clear"):
+        _adb("emu", "geo", "nmea", "$GPGGA,,,,,,0,,,,,,,,*66")
+        return _ok({"cleared": True})
+    lat = float(params.get("lat"))
+    lng = float(params.get("lng"))
+    if not -90.0 <= lat <= 90.0 or not -180.0 <= lng <= 180.0:
+        raise ValueError("lat must be -90..90 and lng -180..180")
+    _adb("emu", "geo", "fix", f"{lng:.6f}", f"{lat:.6f}")
+    return _ok({"lat": lat, "lng": lng})
+
+
+def _handle_battery(params):
+    if params.get("reset"):
+        _adb_shell("dumpsys", "battery", "reset")
+        return _ok({"reset": True})
+    if params.get("unplug"):
+        _adb_shell("dumpsys", "battery", "unplug")
+        return _ok({"unplugged": True})
+    level = _int_param(params, "level", required=True, lo=0, hi=100)
+    _adb_shell("dumpsys", "battery", "set", "level", str(level))
+    return _ok({"level": level})
+
+
+def _handle_network(params):
+    condition = _text_param(params, "condition", max_len=16)
+    if condition not in ("offline", "slow", "fast"):
+        raise ValueError(f"unknown condition: {condition}")
+    if condition == "offline":
+        _adb_shell("svc", "wifi", "disable")
+        _adb_shell("svc", "data", "disable")
+    elif condition == "slow":
+        _adb_shell("svc", "wifi", "enable")
+        _adb_shell("svc", "data", "enable")
+        _adb_shell("tc", "qdisc", "add", "dev", "wlan0", "root", "netem", "delay", "500ms", "loss", "10%")
+    else:
+        _adb_shell("tc", "qdisc", "del", "dev", "wlan0", "root")
+        _adb_shell("svc", "wifi", "enable")
+        _adb_shell("svc", "data", "enable")
+    return _ok({"condition": condition})
+
+
+def _handle_deeplink(params):
+    url = _text_param(params, "url", max_len=2048)
+    if not _RE_URL.match(url):
+        return _err(f"invalid url: {url}", code="invalid_param")
+    out, err, rc = _adb_shell("am", "start", "-a", "android.intent.action.VIEW", "-d", url)
+    return _ok({"url": url, "stdout": out, "stderr": err, "exit_code": rc})

@@ -5,7 +5,7 @@
 set -euo pipefail
 export ANDROID_HOME="$HOME/Android/Sdk"
 export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-AVD="hermes-test"
+AVD="${ANDROID_EMULATOR_AVD:-pixel7pro}"
 
 case "${1:-status}" in
   start)
@@ -41,7 +41,7 @@ case "${1:-status}" in
     sleep 2
     if adb devices | grep -q "emulator"; then
       echo "Force killing..."
-      pkill -f "emulator.*hermes-test" 2>/dev/null || true
+      pkill -f "emulator.*-avd $AVD" 2>/dev/null || true
     fi
     echo "Stopped."
     ;;

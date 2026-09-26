@@ -1,3 +1,3 @@
 name: android-emulator
-version: "1.0"
+version: "1.1.0"
 description: Control a headless Android emulator (AVD) via ADB — install APKs, take screenshots, tap/swipe, manage apps, push/pull files.

@@ -9,7 +9,7 @@ import {
   useQuery,
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 
 const ID = 'android-emulator'
 const POLL_MS = 3000
@@ -36,6 +36,9 @@ function EmulatorPane({ ctx }) {
   const [notifBody, setNotifBody] = useState('From Hermes')
   const [isRecording, setIsRecording] = useState(false)
   const [testOutput, setTestOutput] = useState('')
+  const [logFilter, setLogFilter] = useState('')
+  const [apkPath, setApkPath] = useState('')
+  const [isCapturing, setIsCapturing] = useState(false)
   const [tab, setTab] = useState('controls')
   const imgRef = useRef(null)
   // SVG Icons
@@ -88,11 +91,11 @@ function EmulatorPane({ ctx }) {
 
   const sendKey = useCallback(async (key) => {
     haptic('tap')
-    try { await ctx.rest(`/input/key/${key}`, { timeoutMs: 3000 }) } catch {}
+    try { await ctx.rest(`/input/key/${key}`, { method: 'POST', timeoutMs: 3000 }) } catch {}
   }, [ctx])
 
   const sendTap = useCallback(async (x, y) => {
-    try { await ctx.rest(`/input/tap/${x}/${y}`, { timeoutMs: 3000 }) } catch {}
+    try { await ctx.rest(`/input/tap/${x}/${y}`, { method: 'POST', timeoutMs: 3000 }) } catch {}
   }, [ctx])
 
   const handleImageClick = (e) => {
@@ -108,7 +111,8 @@ function EmulatorPane({ ctx }) {
 
   const fetchLogcat = async () => {
     try {
-      const d = await ctx.rest('/logcat?lines=80', { timeoutMs: 5000 })
+      const q = logFilter ? `&filter=${encodeURIComponent(logFilter)}` : ''
+      const d = await ctx.rest(`/logcat?lines=80${q}`, { timeoutMs: 5000 })
       setLogcat(d?.lines || [])
     } catch {}
   }
@@ -197,28 +201,134 @@ function EmulatorPane({ ctx }) {
   const sendNotification = useCallback(async () => {
     haptic('tap')
     try {
-      await ctx.rest(`/notification?title=${encodeURIComponent(notifTitle)}&body=${encodeURIComponent(notifBody)}`, { method: 'POST', timeoutMs: 3000 })
-      host.notify({ kind: 'success', message: 'Notification sent' })
-    } catch {}
+      const r = await ctx.rest(`/notification?title=${encodeURIComponent(notifTitle)}&body=${encodeURIComponent(notifBody)}`, { method: 'POST', timeoutMs: 5000 })
+      host.notify(r?.ok
+        ? { kind: 'success', message: 'Notification sent' }
+        : { kind: 'error', message: r?.error || 'Notification not delivered' })
+    } catch { host.notify({ kind: 'error', message: 'Notification request failed' }) }
   }, [ctx, notifTitle, notifBody])
 
   const toggleRecording = useCallback(async () => {
     haptic('tap')
     if (!isRecording) {
-      try { await ctx.rest('/record/start', { method: 'POST' }); setIsRecording(true) } catch {}
+      try {
+        const r = await ctx.rest('/record/start', { method: 'POST' })
+        if (r?.ok) { setIsRecording(true); host.notify({ kind: 'success', message: r.message || 'Recording started' }) }
+        else host.notify({ kind: 'error', message: r?.error || 'Recording failed to start' })
+      } catch { host.notify({ kind: 'error', message: 'Recording request failed' }) }
     } else {
-      try { await ctx.rest('/record/stop', { method: 'POST' }); setIsRecording(false) } catch {}
+      try {
+        const r = await ctx.rest('/record/stop', { method: 'POST', timeoutMs: 30000 })
+        setIsRecording(false)
+        host.notify(r?.ok
+          ? { kind: 'success', message: `Recording saved: ${(r.path || '').split('/').pop()} (${r.size || 0} bytes)` }
+          : { kind: 'error', message: r?.error || 'Recording not saved' })
+      } catch { setIsRecording(false); host.notify({ kind: 'error', message: 'Recording stop failed' }) }
     }
   }, [ctx, isRecording])
+
+  const toggleCapture = useCallback(async () => {
+    haptic('tap')
+    if (!isCapturing) {
+      try {
+        const r = await ctx.rest('/replay/record/start', { method: 'POST' })
+        if (r?.ok) { setIsCapturing(true); host.notify({ kind: 'success', message: r.message || 'Capturing touches' }) }
+        else host.notify({ kind: 'error', message: r?.error || 'Capture failed to start' })
+      } catch { host.notify({ kind: 'error', message: 'Capture request failed' }) }
+    } else {
+      try {
+        const r = await ctx.rest('/replay/record/stop', { method: 'POST', timeoutMs: 20000 })
+        setIsCapturing(false)
+        host.notify(r?.ok
+          ? { kind: 'success', message: `Saved ${r.gestures || 0} gesture(s)` }
+          : { kind: 'error', message: r?.error || 'Capture not saved' })
+      } catch { setIsCapturing(false); host.notify({ kind: 'error', message: 'Capture stop failed' }) }
+    }
+  }, [ctx, isCapturing])
+
+  const playReplay = useCallback(async () => {
+    haptic('tap')
+    try {
+      const r = await ctx.rest('/replay/play', { method: 'POST', timeoutMs: 60000 })
+      host.notify(r?.ok
+        ? { kind: 'success', message: `Replayed ${r.played || 0} gesture(s)` }
+        : { kind: 'error', message: r?.error || 'Replay failed' })
+    } catch { host.notify({ kind: 'error', message: 'Replay request failed' }) }
+  }, [ctx])
+
+  const installApk = useCallback(async () => {
+    if (!apkPath) return
+    haptic('tap')
+    try {
+      const r = await ctx.rest(`/apps/install?apk_path=${encodeURIComponent(apkPath)}`, { method: 'POST', timeoutMs: 120000 })
+      host.notify(r?.ok
+        ? { kind: 'success', message: 'APK installed' }
+        : { kind: 'error', message: r?.error || (r?.output || 'Install failed') })
+    } catch { host.notify({ kind: 'error', message: 'Install request failed' }) }
+  }, [ctx, apkPath])
+
+  const uninstallApp = useCallback(async (pkg) => {
+    haptic('tap')
+    try {
+      const r = await ctx.rest(`/apps/uninstall?package=${encodeURIComponent(pkg)}`, { method: 'POST', timeoutMs: 30000 })
+      host.notify(r?.ok
+        ? { kind: 'success', message: `Uninstalled ${pkg}` }
+        : { kind: 'error', message: r?.error || `Uninstall failed: ${r?.output || ''}` })
+      if (r?.ok) fetchApps()
+    } catch { host.notify({ kind: 'error', message: 'Uninstall request failed' }) }
+  }, [ctx])
+
+  const switchAvd = useCallback(async (name) => {
+    haptic('tap')
+    host.notify({ kind: 'info', message: `Switching to ${name}...` })
+    try {
+      const r = await ctx.rest(`/picker/switch?name=${encodeURIComponent(name)}`, { method: 'POST', timeoutMs: 30000 })
+      host.notify(r?.ok
+        ? { kind: 'success', message: `Switched to ${name}` }
+        : { kind: 'error', message: r?.error || 'Switch failed' })
+    } catch { host.notify({ kind: 'error', message: 'Switch request failed' }) }
+  }, [ctx])
+
+  const clearGps = useCallback(async () => {
+    haptic('tap')
+    try {
+      const r = await ctx.rest('/gps/clear', { method: 'POST', timeoutMs: 3000 })
+      host.notify({ kind: r?.ok ? 'success' : 'error', message: r?.ok ? 'GPS override cleared' : (r?.error || 'GPS clear failed') })
+    } catch {}
+  }, [ctx])
+
+  const unplugBattery = useCallback(async () => {
+    haptic('tap')
+    try {
+      const r = await ctx.rest('/battery/unplug', { method: 'POST', timeoutMs: 3000 })
+      host.notify({ kind: r?.ok ? 'success' : 'error', message: r?.ok ? 'Battery: unplugged (draining)' : (r?.error || 'Battery unplug failed') })
+    } catch {}
+  }, [ctx])
 
   const runTests = useCallback(async () => {
     haptic('tap')
     setTestOutput('Running tests...')
     try {
       const r = await ctx.rest('/test/run', { method: 'POST', timeoutMs: 300000 })
-      setTestOutput(r?.output || 'No output')
+      setTestOutput(r?.output || (r?.error || 'No output'))
     } catch { setTestOutput('Test request failed') }
   }, [ctx])
+
+  // ── Keyboard shortcuts (matches GET /shortcuts) ──────────────────────
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (!e.ctrlKey && !e.metaKey) return
+      const k = e.key.toLowerCase()
+      if (k === 's') { e.preventDefault(); e.stopPropagation(); saveScreenshot() }
+      else if (k === 'h') { e.preventDefault(); e.stopPropagation(); sendKey('HOME') }
+      else if (k === 'b') { e.preventDefault(); e.stopPropagation(); sendKey('BACK') }
+      else if (k === 'l') { e.preventDefault(); e.stopPropagation(); setShowLog((v) => { if (!v) fetchLogcat(); return !v }) }
+      else if (k === 'g') { e.preventDefault(); e.stopPropagation(); setShowMore(true); setShowGallery((v) => { if (!v) fetchGallery(); return !v }) }
+      else if (k === 'r') { e.preventDefault(); e.stopPropagation(); toggleRecording() }
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [saveScreenshot, sendKey, toggleRecording])
 
   let screenContent
   if (!isOnline) {
@@ -477,6 +587,27 @@ function EmulatorPane({ ctx }) {
                 ],
               }),
 
+              // Logcat filter
+              showLog && jsx('div', {
+                key: 'logfilter',
+                className: 'flex gap-1',
+                children: [
+                  jsx('input', {
+                    type: 'text',
+                    value: logFilter,
+                    onChange: (e) => setLogFilter(e.target.value),
+                    onKeyDown: (e) => { if (e.key === 'Enter') fetchLogcat() },
+                    placeholder: "filter e.g. ActivityManager:I *:S",
+                    className: 'flex-1 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-zinc-200 placeholder-zinc-500 outline-none focus:border-blue-600 font-mono text-[10px]',
+                  }),
+                  jsx('button', {
+                    className: 'rounded border border-blue-700 bg-blue-900/50 px-2 py-1 text-blue-300',
+                    onClick: fetchLogcat,
+                    children: 'Apply',
+                  }),
+                ],
+              }),
+
               // Logcat
               showLog && jsx('div', {
                 className: 'flex-1 min-h-0 overflow-auto rounded bg-zinc-950 border border-zinc-800 p-1 font-mono text-[10px] leading-relaxed',
@@ -551,7 +682,7 @@ function EmulatorPane({ ctx }) {
                         'w-full text-left rounded border px-2 py-1.5 transition-colors',
                         avd.name === picker?.active_avd ? 'border-blue-700 bg-blue-900/30 text-blue-300' : 'border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
                       ),
-                      onClick: () => host.notify({ kind: 'info', message: `Switch: emu stop && emu start ${avd.name}` }),
+                      onClick: () => switchAvd(avd.name),
                       children: jsxs('div', {
                         className: 'flex justify-between items-center',
                         children: [
@@ -618,19 +749,52 @@ function EmulatorPane({ ctx }) {
                 ],
               }),
               showApps && jsx('div', {
-                className: 'rounded border border-zinc-700 bg-zinc-900 p-1 max-h-[200px] overflow-y-auto space-y-0.5',
-                children: apps.length === 0
-                  ? jsx('div', { className: 'text-zinc-500 p-1', children: 'Loading apps...' })
-                  : [
+                className: 'rounded border border-zinc-700 bg-zinc-900 p-1 max-h-[260px] overflow-y-auto space-y-0.5',
+                children: [
+                  // Install APK (host path on the gateway machine)
+                  jsx('div', {
+                    key: 'install',
+                    className: 'flex gap-1 px-1 py-1 border-b border-zinc-800',
+                    children: [
+                      jsx('input', {
+                        type: 'text',
+                        value: apkPath,
+                        onChange: (e) => setApkPath(e.target.value),
+                        placeholder: '/path/to/app.apk (gateway host)',
+                        className: 'flex-1 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-zinc-200 placeholder-zinc-500 outline-none focus:border-blue-600 font-mono text-[10px]',
+                      }),
+                      jsx('button', {
+                        className: 'rounded border border-blue-700 bg-blue-900/50 px-2 py-1 text-blue-300 hover:bg-blue-800/50',
+                        onClick: installApk,
+                        children: 'Install',
+                      }),
+                    ],
+                  }),
+                  apps.length === 0
+                    ? jsx('div', { key: 'empty', className: 'text-zinc-500 p-1', children: 'Loading apps...' })
+                    : [
                       jsx('div', { key: 'uh', className: 'text-[10px] text-blue-400 font-medium px-2 pt-1', children: `📱 Your Apps (${apps.filter(a => a.type === 'user').length})` }),
                       ...apps.filter(a => a.type === 'user').map((app) =>
-                        jsx('button', {
+                        jsx('div', {
                           key: app.package,
                           className: 'w-full flex justify-between items-center rounded px-2 py-1 text-zinc-200 hover:bg-zinc-700',
-                          onClick: () => launchApp(app.package),
                           children: [
-                            jsx('span', { className: 'truncate flex-1 text-left font-medium', children: app.label }),
-                            jsx('span', { className: 'text-zinc-500 text-[10px]', children: '▶ Launch' }),
+                            jsx('span', {
+                              className: 'truncate flex-1 text-left font-medium cursor-pointer',
+                              onClick: () => launchApp(app.package),
+                              children: app.label,
+                            }),
+                            jsx('span', {
+                              className: 'text-zinc-500 text-[10px] cursor-pointer hover:text-zinc-300',
+                              onClick: () => launchApp(app.package),
+                              children: '▶ Launch',
+                            }),
+                            jsx('span', {
+                              className: 'text-red-500/70 text-[10px] cursor-pointer hover:text-red-400 ml-1',
+                              onClick: () => uninstallApp(app.package),
+                              title: `Uninstall ${app.package}`,
+                              children: '✕',
+                            }),
                           ],
                         })
                       ),
@@ -647,6 +811,7 @@ function EmulatorPane({ ctx }) {
                         })
                       ),
                     ],
+                ],
               }),
 
               // Advanced Tools
@@ -669,6 +834,7 @@ function EmulatorPane({ ctx }) {
                       jsx('input', { type: 'text', value: gpsLat, onChange: (e) => setGpsLat(e.target.value), placeholder: 'Latitude', className: 'flex-1 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-zinc-200 font-mono' }),
                       jsx('input', { type: 'text', value: gpsLng, onChange: (e) => setGpsLng(e.target.value), placeholder: 'Longitude', className: 'flex-1 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-zinc-200 font-mono' }),
                       jsx('button', { className: 'rounded border border-blue-700 bg-blue-900/50 px-3 py-1 text-blue-300', onClick: setGps, children: 'Set' }),
+                      jsx('button', { className: 'rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-zinc-300', onClick: clearGps, children: 'Clear' }),
                     ],
                   }),
 
@@ -680,6 +846,7 @@ function EmulatorPane({ ctx }) {
                       jsx('input', { type: 'range', min: '0', max: '100', value: batteryLevel, onChange: (e) => setBattery(parseInt(e.target.value)), className: 'flex-1' }),
                       jsx('button', { className: 'rounded border border-blue-700 bg-blue-900/50 px-2 py-1 text-blue-300', onClick: () => setBattery(batteryLevel), children: 'Set' }),
                       jsx('button', { className: 'rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-zinc-300', onClick: async () => { try { await ctx.rest('/battery/reset', { method: 'POST' }); setBatteryLevel(100) } catch {} }, children: 'Reset' }),
+                      jsx('button', { className: 'rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-zinc-300', onClick: unplugBattery, children: 'Unplug' }),
                     ],
                   }),
 
@@ -709,6 +876,21 @@ function EmulatorPane({ ctx }) {
                     className: cn('w-full rounded border py-1.5 font-medium', isRecording ? 'border-red-700 bg-red-900/50 text-red-300' : 'border-zinc-700 bg-zinc-800 text-zinc-300'),
                     onClick: toggleRecording,
                     children: isRecording ? '⏹ Stop Recording' : '⏺ Start Recording',
+                  }),
+                  jsx('div', {
+                    className: 'flex gap-1 pt-1',
+                    children: [
+                      jsx('button', {
+                        className: cn('flex-1 rounded border py-1.5', isCapturing ? 'border-amber-700 bg-amber-900/50 text-amber-300' : 'border-zinc-700 bg-zinc-800 text-zinc-300'),
+                        onClick: toggleCapture,
+                        children: isCapturing ? '⏹ Stop Touch Capture' : '⏺ Record Touches',
+                      }),
+                      jsx('button', {
+                        className: 'flex-1 rounded border border-zinc-700 bg-zinc-800 py-1.5 text-zinc-300',
+                        onClick: playReplay,
+                        children: '▶ Play Replay',
+                      }),
+                    ],
                   }),
 
                   jsx('div', { className: 'text-zinc-400 font-medium pt-1 border-t border-zinc-800', children: '🧪 Test Runner' }),
