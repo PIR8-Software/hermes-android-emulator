@@ -2,7 +2,7 @@
 
 Control a headless Android emulator from Hermes — install APKs, take screenshots, tap/swipe/type, manage apps, simulate device conditions, and view a live screen in the desktop sidebar.
 
-**Version 1.1.0** — post-audit remediation (2026-09-26): all adb calls are pinned to the
+**Version 1.1.0** — hardening pass (2026-09-26): all adb calls are pinned to the
 emulator serial (a physical device is never targeted unless you explicitly opt in),
 destructive AVD operations require validation + confirmation, mutating API routes are
 POST-only, and every advertised feature below is implemented.
@@ -12,7 +12,8 @@ POST-only, and every advertised feature below is implemented.
 ### Core Emulator Control
 - **Live sidebar panel** — real-time emulator view with tap-to-interact
 - **Start/Stop** — boot and shut down the emulator from the sidebar (stopped narrowly:
-  `adb emu kill` + only the exact process this plugin started — no broad pkill)
+  `adb emu kill` + only the exact process this plugin started — no broad pkill; the
+  `emu stop` CLI fallback kills only the process matching the configured AVD name)
 - **Navigation** — Back, Home, Recent Apps, Power buttons
 - **Swipe gestures** — Up, Down, Left, Right directional swipes (centered on the real screen size)
 - **Text input** — Type text directly into the emulator (shell metacharacters escaped)
@@ -45,7 +46,8 @@ POST-only, and every advertised feature below is implemented.
 
 ### AVD Management
 - **Device picker** — List AVDs and switch between them for real (stop + start)
-- **Android versions** — Install new API levels (21-35)
+- **Android versions** — shows installed vs available Google APIs x86_64 system images;
+  clicking an available API installs it via `sdkmanager` and creates an `api<N>-test` AVD
 - **Create AVDs** — Create new virtual devices from the sidebar (never overwrites an
   existing AVD unless you pass `overwrite=true`)
 - **Delete/Wipe** — Remove or factory reset AVDs via the API (destructive: requires
@@ -144,6 +146,10 @@ Desktop after first install.
   screenshots (`~/.hermes/emulator-screenshots`), touch recordings
   (`~/.hermes/emulator-recordings`), logs (`~/.hermes/emulator-logs`) and AVD data
   (`~/.android/avd/*`) all survive updates.
+- **Activation after copying new files:** agent tools are re-read from disk in new
+  sessions; dashboard API changes take effect after a dashboard restart (restart your
+  `hermes dashboard` service/process); the desktop pane hot-reloads on save (⌘K →
+  "Reload desktop plugins" if it doesn't appear).
 - **Uninstall**: `hermes plugins disable android-emulator`, then delete
   `~/.hermes/plugins/android-emulator` (and the desktop `plugin.js` copy). Your
   screenshots, recordings and AVDs are preserved.
@@ -163,7 +169,7 @@ Desktop after first install.
 | **⌨ Text input** | Type text directly into emulator |
 | **📦 Apps** | App drawer: install APK (host path), launch, uninstall |
 | **📸🌐⏺💻** | Save screenshot, Network sim, Record, Shell |
-| **⏸📜⏹** | Pause, Logcat (with filter), Stop emulator |
+| **⏸▶📜⏹** | Pause/resume live view, Logcat (with filter), Stop emulator |
 | **⚡ More Tools** | GPS, Battery, Deep links, Notifications, Recording, Touch record/replay, Test runner, Gallery |
 
 ### CLI
@@ -249,9 +255,29 @@ Notes:
 python3 -m pytest tests/ -q
 ```
 
-The suite mocks every subprocess (argv-level capture) — no emulator or device is
-touched. It covers the 2026-09-26 audit regressions F-01..F-12 and the feature
-coverage matrix.
+The suite (69 tests) mocks every subprocess (argv-level capture) — no emulator or device
+is touched. It covers the 2026-09-26 hardening regressions: emulator-only device routing
+guards, destructive-operation confirmation gates, path traversal and symlink containment,
+input validation/clamping, the adb shell wire-semantics quoting fix, replay gesture
+parsing, feature coverage for the documented UI/API surface, and a Node runtime
+load/render check of `dashboard/plugin.js`.
+
+## Limitations
+
+- **Tap/swipe replay is approximate.** Touch capture records raw `getevent` streams and
+  derives tap/swipe gestures from them; replay re-synthesizes those gestures via
+  `input tap` / `input swipe`. Timing, pressure, long-press, pinch/multi-touch, and
+  scroll momentum are approximations — replay is functional coverage, not byte-exact
+  playback.
+- **Notifications vary by Android build.** Test notifications are posted with
+  `cmd notification post`; exact rendering, grouping, and behavior differ across Android
+  versions and OEM skins. The plugin reports the real shell result but cannot guarantee
+  identical appearance everywhere.
+- **Test runner output is raw.** `test/run` executes `am instrument` (bounded at 300s)
+  and returns the raw instrumentation output — it does not parse JUnit XML.
+- **Installing an API level needs network + SDK licenses.** The Android-version install
+  path downloads the system image through `sdkmanager`; offline or unlicensed SDKs will
+  fail with the reported error.
 
 ## Troubleshooting
 
