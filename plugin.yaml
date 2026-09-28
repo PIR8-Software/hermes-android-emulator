@@ -1,3 +1,24 @@
 name: android-emulator
 version: "1.1.0"
-description: Control a headless Android emulator (AVD) via ADB — install APKs, take screenshots, tap/swipe, manage apps, push/pull files.
+description: Control a headless Android emulator from Hermes — live sidebar, app management, GPS/battery/network simulation, and ADB tools.
+author: PIR8-Software
+license: MIT
+provides_tools:
+  - emu_status
+  - emu_shell
+  - emu_install
+  - emu_uninstall
+  - emu_screenshot
+  - emu_tap
+  - emu_swipe
+  - emu_type
+  - emu_key
+  - emu_launch
+  - emu_packages
+  - emu_push
+  - emu_pull
+  - emu_logcat
+  - emu_gps
+  - emu_battery
+  - emu_network
+  - emu_deeplink

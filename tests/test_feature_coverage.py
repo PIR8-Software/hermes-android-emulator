@@ -105,7 +105,7 @@ def test_shortcuts_endpoint_lists_real_handler_actions(client):
     r = client.get("/api/plugins/android-emulator/shortcuts")
     actions = {s["action"] for s in r.json()["shortcuts"]}
     assert {"screenshot", "record", "home", "back", "logcat", "gallery"} <= actions
-    js = open("dashboard/plugin.js", encoding="utf-8").read()
+    js = open("desktop/plugin.js", encoding="utf-8").read()
     for needle in ("saveScreenshot()", "toggleRecording()", "sendKey('HOME')",
                    "sendKey('BACK')", "fetchLogcat()", "fetchGallery()"):
         assert needle in js, f"shortcut action not implemented in UI: {needle}"

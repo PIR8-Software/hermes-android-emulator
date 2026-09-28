@@ -14,7 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "__init__.py"
 API_SRC = ROOT / "dashboard" / "plugin_api.py"
-JS_SRC = ROOT / "dashboard" / "plugin.js"
+JS_SRC = ROOT / "desktop" / "plugin.js"
 
 EXPECTED_TOOLS = [
     "emu_status",

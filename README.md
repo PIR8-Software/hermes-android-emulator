@@ -105,10 +105,11 @@ The production deployment is a targeted copy of the five runtime files:
 
 ```bash
 REPO=~/.hermes/plugins/android-emulator-src   # or any checkout of this repo
-mkdir -p ~/.hermes/plugins/android-emulator/dashboard
+mkdir -p ~/.hermes/plugins/android-emulator/dashboard ~/.hermes/plugins/android-emulator/desktop
 cp "$REPO/__init__.py" "$REPO/plugin.yaml" ~/.hermes/plugins/android-emulator/
-cp "$REPO/dashboard/plugin_api.py" "$REPO/dashboard/plugin.js" \
-   "$REPO/dashboard/manifest.json" ~/.hermes/plugins/android-emulator/dashboard/
+cp "$REPO/dashboard/plugin_api.py" "$REPO/dashboard/manifest.json" \
+   ~/.hermes/plugins/android-emulator/dashboard/
+cp "$REPO/desktop/plugin.js" ~/.hermes/plugins/android-emulator/desktop/
 
 hermes plugins enable android-emulator
 ```
@@ -131,7 +132,7 @@ ln -sf ~/.hermes/scripts/emu /usr/local/bin/emu
 
 ### 4. Install the desktop sidebar (optional)
 
-Copy `dashboard/plugin.js` to your Hermes Desktop plugins folder:
+Copy `desktop/plugin.js` to your Hermes Desktop plugins folder:
 
 - **Linux:** `~/.hermes/desktop-plugins/android-emulator/plugin.js`
 - **Windows:** `%LOCALAPPDATA%\hermes\desktop-plugins\android-emulator\plugin.js`
@@ -227,7 +228,7 @@ Full list: `emu_status`, `emu_shell`, `emu_install`, `emu_uninstall`, `emu_scree
 
 - `__init__.py` — Agent tools registered via `ctx.register_tool()`
 - `dashboard/plugin_api.py` — FastAPI `APIRouter` with 41 endpoints
-- `dashboard/plugin.js` — ESM desktop plugin using `ctx.registerMany()` + `useQuery`
+- `desktop/plugin.js` — ESM desktop plugin using `ctx.registerMany()` + `useQuery`
 - `scripts/emu` — Bash wrapper for emulator lifecycle
 
 ## API Endpoints (41)
@@ -260,7 +261,7 @@ is touched. It covers the 2026-09-26 hardening regressions: emulator-only device
 guards, destructive-operation confirmation gates, path traversal and symlink containment,
 input validation/clamping, the adb shell wire-semantics quoting fix, replay gesture
 parsing, feature coverage for the documented UI/API surface, and a Node runtime
-load/render check of `dashboard/plugin.js`.
+load/render check of `desktop/plugin.js`.
 
 ## Limitations
 

@@ -1,5 +1,5 @@
 // plugin.js runtime load/render check (F-16 runtime-loading faults + UI contract).
-// Loads the real dashboard/plugin.js under stubbed SDK modules, renders the pane
+// Loads the real desktop/plugin.js under stubbed SDK modules, renders the pane
 // component once, and drives the keyboard shortcut handler — asserting the same
 // POST-only contract the backend enforces.
 import { readFileSync, writeFileSync } from 'node:fs'
@@ -14,7 +14,7 @@ function assert(cond, msg) {
 }
 
 const here = dirname(fileURLToPath(import.meta.url))
-const src = join(here, '..', '..', 'dashboard', 'plugin.js')
+const src = join(here, '..', '..', 'desktop', 'plugin.js')
 const copy = join(here, 'plugin_copy.mjs')
 writeFileSync(copy, readFileSync(src, 'utf8'))
 
